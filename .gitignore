@@ -2,3 +2,10 @@ build
 data
 pcdet/ops
 pcdet.egg-info
+*.pth
+*.pkl
+*.txt
+output
+*.pyc
+*.log
+pcdet/version.py
