@@ -217,6 +217,128 @@ class RoIHeadTemplate(nn.Module):
 
                 rcnn_loss_reg += loss_corner
                 tb_dict['rcnn_loss_corner'] = loss_corner.item()
+        elif loss_cfgs.REG_LOSS == 'my-smooth-l1':
+            rois_anchor = roi_boxes3d.clone().detach().view(-1, code_size)
+            rois_anchor[:, 0:3] = 0
+            rois_anchor[:, 6] = 0
+            reg_targets = self.box_coder.encode_torch(
+                gt_boxes3d_ct.view(rcnn_batch_size, code_size), rois_anchor
+            )
+
+            rcnn_loss_reg = self.reg_loss_func(
+                rcnn_reg.view(rcnn_batch_size, -1).unsqueeze(dim=0),
+                reg_targets.unsqueeze(dim=0),
+            )  # [B, M, 7]
+            rcnn_loss_reg = (rcnn_loss_reg.view(rcnn_batch_size, -1) * fg_mask.unsqueeze(dim=-1).float()).sum() / max(fg_sum, 1)
+            rcnn_loss_reg = rcnn_loss_reg * loss_cfgs.LOSS_WEIGHTS['rcnn_reg_weight']
+
+            decoded_boxes = self.box_coder.decode_torch(
+                rcnn_reg.view(rcnn_batch_size, -1).unsqueeze(dim=0),  # モデルの出力
+                roi_boxes3d.view(rcnn_batch_size, -1)  # Anchor/ROI情報
+            )
+            # モデル出力の中心座標
+            pred_center = decoded_boxes[:, :3]  # [x, y, z] from predicted boxes
+            distance = torch.norm(pred_center, dim=1)
+            tb_dict['distance'] = distance.mean().item()
+        
+            weights = 1.0 / (distance + loss_cfgs.LOSS_WEIGHTS['distance_weight']) + 1 # 距離が小さいほど重みが大きくなる
+            weights = weights.mean()
+            tb_dict['weights'] = weights.item()
+            rcnn_loss_reg = rcnn_loss_reg * weights
+
+            tb_dict['rcnn_loss_reg'] = rcnn_loss_reg.item()
+            
+            if loss_cfgs.CORNER_LOSS_REGULARIZATION and fg_sum > 0:
+                # TODO: NEED to BE CHECK
+                fg_rcnn_reg = rcnn_reg.view(rcnn_batch_size, -1)[fg_mask]
+                fg_roi_boxes3d = roi_boxes3d.view(-1, code_size)[fg_mask]
+
+                fg_roi_boxes3d = fg_roi_boxes3d.view(1, -1, code_size)
+                batch_anchors = fg_roi_boxes3d.clone().detach()
+                roi_ry = fg_roi_boxes3d[:, :, 6].view(-1)
+                roi_xyz = fg_roi_boxes3d[:, :, 0:3].view(-1, 3)
+                batch_anchors[:, :, 0:3] = 0
+                rcnn_boxes3d = self.box_coder.decode_torch(
+                    fg_rcnn_reg.view(batch_anchors.shape[0], -1, code_size), batch_anchors
+                ).view(-1, code_size)
+
+                rcnn_boxes3d = common_utils.rotate_points_along_z(
+                    rcnn_boxes3d.unsqueeze(dim=1), roi_ry
+                ).squeeze(dim=1)
+                rcnn_boxes3d[:, 0:3] += roi_xyz
+
+                loss_corner = loss_utils.get_corner_loss_lidar(
+                    rcnn_boxes3d[:, 0:7],
+                    gt_of_rois_src[fg_mask][:, 0:7]
+                )
+                loss_corner = loss_corner.mean()
+                loss_corner = loss_corner * loss_cfgs.LOSS_WEIGHTS['rcnn_corner_weight']
+
+                loss_corner = loss_corner * weights
+                rcnn_loss_reg += loss_corner
+                tb_dict['rcnn_loss_corner'] = loss_corner.item()
+        elif loss_cfgs.REG_LOSS == 'my-smooth-l1-v2':
+            rois_anchor = roi_boxes3d.clone().detach().view(-1, code_size)
+            rois_anchor[:, 0:3] = 0
+            rois_anchor[:, 6] = 0
+            reg_targets = self.box_coder.encode_torch(
+                gt_boxes3d_ct.view(rcnn_batch_size, code_size), rois_anchor
+            )
+            
+            rcnn_loss_reg = self.reg_loss_func(
+                rcnn_reg.view(rcnn_batch_size, -1).unsqueeze(dim=0),
+                reg_targets.unsqueeze(dim=0),
+            )  # [B, M, 7]
+            rcnn_loss_reg = (rcnn_loss_reg.view(rcnn_batch_size, -1) * fg_mask.unsqueeze(dim=-1).float()).sum() / max(fg_sum, 1)
+            rcnn_loss_reg = rcnn_loss_reg * loss_cfgs.LOSS_WEIGHTS['rcnn_reg_weight']
+
+            
+            # GT bboxの中心座標を計算
+            gt_center = gt_boxes3d_ct[:, :3]  # [x, y, z] from GT boxes
+
+            # GT中心座標から距離を計算
+            distance = torch.norm(gt_center, dim=1)  # GT中心座標からの距離を計算
+            tb_dict['distance'] = distance.mean().item()  # 平均距離を記録
+
+            # 距離に基づく重みを計算
+            weights = 1.0 / (distance + loss_cfgs.LOSS_WEIGHTS['distance_weight']) + 1  # 距離が小さいほど重みが大きくなる
+            weights = weights.mean()
+            tb_dict['weights'] = weights.item()
+
+            # 重みをRCNNの回帰損失に適用
+            rcnn_loss_reg = rcnn_loss_reg * weights
+
+            tb_dict['rcnn_loss_reg'] = rcnn_loss_reg.item()
+
+            if loss_cfgs.CORNER_LOSS_REGULARIZATION and fg_sum > 0:
+                fg_rcnn_reg = rcnn_reg.view(rcnn_batch_size, -1)[fg_mask]
+                fg_roi_boxes3d = roi_boxes3d.view(-1, code_size)[fg_mask]
+
+                fg_roi_boxes3d = fg_roi_boxes3d.view(1, -1, code_size)
+                batch_anchors = fg_roi_boxes3d.clone().detach()
+                roi_ry = fg_roi_boxes3d[:, :, 6].view(-1)
+                roi_xyz = fg_roi_boxes3d[:, :, 0:3].view(-1, 3)
+                batch_anchors[:, :, 0:3] = 0
+                rcnn_boxes3d = self.box_coder.decode_torch(
+                    fg_rcnn_reg.view(batch_anchors.shape[0], -1, code_size), batch_anchors
+                ).view(-1, code_size)
+
+                rcnn_boxes3d = common_utils.rotate_points_along_z(
+                    rcnn_boxes3d.unsqueeze(dim=1), roi_ry
+                ).squeeze(dim=1)
+                rcnn_boxes3d[:, 0:3] += roi_xyz
+
+                loss_corner = loss_utils.get_corner_loss_lidar(
+                    rcnn_boxes3d[:, 0:7],
+                    gt_of_rois_src[fg_mask][:, 0:7]
+                )
+                loss_corner = loss_corner.mean()
+                loss_corner = loss_corner * loss_cfgs.LOSS_WEIGHTS['rcnn_corner_weight']
+
+                # GT中心座標に基づく重みを適用
+                loss_corner = loss_corner * weights
+                rcnn_loss_reg += loss_corner
+                tb_dict['rcnn_loss_corner'] = loss_corner.item()
         else:
             raise NotImplementedError
 
