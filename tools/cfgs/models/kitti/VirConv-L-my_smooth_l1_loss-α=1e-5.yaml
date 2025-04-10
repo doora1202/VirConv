@@ -256,7 +256,7 @@ MODEL:
 
         LOSS_CONFIG:
             CLS_LOSS: BinaryCrossEntropy
-            REG_LOSS: my-smooth-l1-v2
+            REG_LOSS: my-smooth-l1
             CORNER_LOSS_REGULARIZATION: True
             GRID_3D_IOU_LOSS: False
             LOSS_WEIGHTS: {
