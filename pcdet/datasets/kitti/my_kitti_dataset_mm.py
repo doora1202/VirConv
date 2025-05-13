@@ -24,7 +24,7 @@ class KittiDatasetMM(DatasetTemplate):
             dataset_cfg=dataset_cfg, class_names=class_names, training=training, root_path=root_path, logger=logger
         )
         self.split = self.dataset_cfg.DATA_SPLIT[self.mode]
-        self.root_split_path = self.root_path / ('training' if self.split != 'test' else 'testing')
+        self.root_split_path = self.root_path / 'training'
 
         split_dir = self.root_path / 'ImageSets' / 'myset' / (self.split + '.txt')
         self.sample_id_list = [x.strip() for x in open(split_dir).readlines()] if split_dir.exists() else None
@@ -55,7 +55,7 @@ class KittiDatasetMM(DatasetTemplate):
             dataset_cfg=self.dataset_cfg, class_names=self.class_names, training=self.training, root_path=self.root_path, logger=self.logger
         )
         self.split = split
-        self.root_split_path = self.root_path / ('training' if self.split != 'test' else 'testing')
+        self.root_split_path = self.root_path / 'training'
 
         split_dir = self.root_path / 'ImageSets' / 'myset' / (self.split + '.txt')
         self.sample_id_list = [x.strip() for x in open(split_dir).readlines()] if split_dir.exists() else None
@@ -459,7 +459,7 @@ def create_kitti_infos(dataset_cfg, class_names, data_path, save_path, workers=4
     print('Kitti info trainval file is saved to %s' % trainval_filename)
     
     dataset.set_split('test')
-    kitti_infos_test = dataset.get_infos(num_workers=workers, has_label=False, count_inside_pts=False)
+    kitti_infos_test = dataset.get_infos(num_workers=workers, has_label=True, count_inside_pts=True)
     with open(test_filename, 'wb') as f:
         pickle.dump(kitti_infos_test, f)
     print('Kitti info test file is saved to %s' % test_filename)
