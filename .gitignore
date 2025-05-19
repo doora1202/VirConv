@@ -10,3 +10,4 @@ output
 *.log
 pcdet/version.py
 pe.pth.tar
+.vscode
