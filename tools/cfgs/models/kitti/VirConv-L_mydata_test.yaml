@@ -11,7 +11,7 @@ DATA_CONFIG:
 
     DATA_SPLIT: {
         'train': train,
-        'test': test
+        'test': val
     }
 
     INFO_PATH: {
