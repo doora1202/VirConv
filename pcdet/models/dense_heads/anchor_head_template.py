@@ -7,7 +7,6 @@ from .target_assigner.anchor_generator import AnchorGenerator
 from .target_assigner.atss_target_assigner import ATSSTargetAssigner
 from .target_assigner.axis_aligned_target_assigner import AxisAlignedTargetAssigner
 from ...utils.odiou_loss import odiou_3D
-from ...utils.giou3d_loss import GIoU3DLoss
 from ..model_utils.model_nms_utils import class_agnostic_nms
 import copy
 
@@ -162,10 +161,6 @@ class AnchorHeadTemplate(nn.Module):
             'od_loss_func',
             odiou_3D()
         )
-        self.add_module(
-            'giou3d_loss_func',
-            GIoU3DLoss(reduction='mean')
-        )
 
     def assign_targets(self, gt_boxes):
         """
@@ -245,100 +240,56 @@ class AnchorHeadTemplate(nn.Module):
         return dir_cls_targets
 
     def get_box_reg_layer_loss(self):
-        box_preds_orig = self.forward_ret_dict['box_preds']
-        box_dir_cls_preds_orig = self.forward_ret_dict.get('dir_cls_preds', None)
-        box_reg_targets_orig = self.forward_ret_dict['box_reg_targets']
-        box_cls_labels_orig = self.forward_ret_dict['box_cls_labels']
-        
-        batch_size = int(box_preds_orig.shape[0])
+        box_preds = self.forward_ret_dict['box_preds']
+        box_dir_cls_preds = self.forward_ret_dict.get('dir_cls_preds', None)
+        box_reg_targets = self.forward_ret_dict['box_reg_targets']
+        box_cls_labels = self.forward_ret_dict['box_cls_labels']
+        batch_size = int(box_preds.shape[0])
 
-        positives_orig = box_cls_labels_orig > 0
-        reg_weights_orig = positives_orig.float()
-        pos_normalizer_orig = positives_orig.sum(1, keepdim=True).float()
-        reg_weights_orig /= torch.clamp(pos_normalizer_orig, min=1.0)
+        positives = box_cls_labels > 0
+        reg_weights = positives.float()
+        pos_normalizer = positives.sum(1, keepdim=True).float()
+        reg_weights /= torch.clamp(pos_normalizer, min=1.0)
 
         if isinstance(self.anchors, list):
             if self.use_multihead:
-                anchors_for_loss = torch.cat(
+                anchors = torch.cat(
                     [anchor.permute(3, 4, 0, 1, 2, 5).contiguous().view(-1, anchor.shape[-1]) for anchor in
                      self.anchors], dim=0)
             else:
-                current_anchors_list = []
-                for anchor_layer in self.anchors:
-                    current_anchors_list.append(anchor_layer.contiguous().view(-1, anchor_layer.shape[-1]))
-                anchors_for_loss = torch.cat(current_anchors_list, dim=0)
+                anchors = torch.cat(self.anchors, dim=-3)
         else:
-            anchors_for_loss = self.anchors.contiguous().view(-1, self.anchors.shape[-1])
+            anchors = self.anchors
+        anchors = anchors.view(1, -1, anchors.shape[-1]).repeat(batch_size, 1, 1)
+        box_preds = box_preds.view(batch_size, -1,
+                                   box_preds.shape[-1] // self.num_anchors_per_location if not self.use_multihead else
+                                   box_preds.shape[-1])
+        # sin(a - b) = sinacosb-cosasinb
+        box_preds_sin, reg_targets_sin = self.add_sin_difference(box_preds, box_reg_targets)
+        loc_loss_src = self.reg_loss_func(box_preds_sin, reg_targets_sin, weights=reg_weights)  # [N, M]
+        loc_loss = loc_loss_src.sum() / batch_size
 
-        batch_anchors_for_loss = anchors_for_loss.view(1, -1, anchors_for_loss.shape[-1]).repeat(batch_size, 1, 1)
+        loc_loss = loc_loss * self.model_cfg.LOSS_CONFIG.LOSS_WEIGHTS['loc_weight']
+        box_loss = loc_loss
+        tb_dict = {
+            'rpn_loss_loc': loc_loss.item()
+        }
 
-        box_preds_for_loss = box_preds_orig.view(batch_size, -1,
-                                           box_preds_orig.shape[-1] // self.num_anchors_per_location if not self.use_multihead else
-                                           box_preds_orig.shape[-1])
-        box_reg_targets_for_loss = box_reg_targets_orig.view(batch_size, -1, box_reg_targets_orig.shape[-1])
-
-        tb_dict = {}
-        calculated_loc_loss = torch.tensor(0.0).to(box_preds_orig.device)
-        
-        if self.model_cfg.LOSS_CONFIG.get('USE_GIOU_FOR_LOC', False) or \
-           self.model_cfg.LOSS_CONFIG.get('ADD_GIOU_LOSS', False):
-            
-            if positives_orig.any():
-                pos_mask_flat_for_giou = positives_orig.view(batch_size, -1)
-
-                pred_boxes_giou_input = box_preds_for_loss[pos_mask_flat_for_giou]
-                target_boxes_encoded_giou_input = box_reg_targets_for_loss[pos_mask_flat_for_giou]
-                anchors_giou_input = batch_anchors_for_loss[pos_mask_flat_for_giou]
-
-                if pred_boxes_giou_input.numel() > 0:
-                    decoded_pred_giou = self.box_coder.decode_torch(pred_boxes_giou_input, anchors_giou_input)
-                    decoded_target_giou = self.box_coder.decode_torch(target_boxes_encoded_giou_input, anchors_giou_input)
-
-                    if decoded_pred_giou.numel() > 0:
-                        giou_loss_raw = self.giou3d_loss_func(decoded_pred_giou, decoded_target_giou)
-                        giou_weight = self.model_cfg.LOSS_CONFIG.LOSS_WEIGHTS.get('giou_weight', self.model_cfg.LOSS_CONFIG.LOSS_WEIGHTS['loc_weight'])
-                        weighted_giou = giou_loss_raw * giou_weight
-
-                        if self.model_cfg.LOSS_CONFIG.get('USE_GIOU_FOR_LOC', False):
-                            calculated_loc_loss = weighted_giou
-                        else: 
-                            calculated_loc_loss += weighted_giou
-        
-        if not self.model_cfg.LOSS_CONFIG.get('USE_GIOU_FOR_LOC', False):
-            box_preds_sin_orig, reg_targets_sin_orig = self.add_sin_difference(box_preds_for_loss, box_reg_targets_for_loss)
-            reg_weights_for_smoothl1 = reg_weights_orig.view(batch_size, -1)
-            loc_loss_src_orig = self.reg_loss_func(box_preds_sin_orig, reg_targets_sin_orig, weights=reg_weights_for_smoothl1)
-            current_smoothl1_loss = loc_loss_src_orig.sum() / batch_size
-            current_smoothl1_loss_weighted = current_smoothl1_loss * self.model_cfg.LOSS_CONFIG.LOSS_WEIGHTS['loc_weight']
-            
-            if self.model_cfg.LOSS_CONFIG.get('ADD_GIOU_LOSS', False):
-                calculated_loc_loss += current_smoothl1_loss_weighted
-            else: 
-                calculated_loc_loss = current_smoothl1_loss_weighted
-
-        loc_loss = calculated_loc_loss
-        tb_dict['rpn_loss_loc'] = loc_loss.item() if isinstance(loc_loss, torch.Tensor) else loc_loss
-        
-        dir_loss_val = torch.tensor(0.0).to(box_preds_orig.device)
-        if box_dir_cls_preds_orig is not None:
-            dir_targets_orig = self.get_direction_target(
-                batch_anchors_for_loss, 
-                box_reg_targets_for_loss, 
-                one_hot=True, 
+        if box_dir_cls_preds is not None:
+            dir_targets = self.get_direction_target(
+                anchors, box_reg_targets,
                 dir_offset=self.model_cfg.DIR_OFFSET,
                 num_bins=self.model_cfg.NUM_DIR_BINS
             )
 
-            dir_logits_orig = box_dir_cls_preds_orig.view(batch_size, -1, self.model_cfg.NUM_DIR_BINS)
-            weights_dir_orig = positives_orig.view(batch_size, -1).float()
-
-            current_dir_loss_elements = self.dir_loss_func(dir_logits_orig, dir_targets_orig, weights=weights_dir_orig)
-            dir_loss_val_sum = current_dir_loss_elements.sum() / batch_size
-            dir_loss_val = dir_loss_val_sum * self.model_cfg.LOSS_CONFIG.LOSS_WEIGHTS['dir_weight']
-                
-        tb_dict['rpn_loss_dir'] = dir_loss_val.item() if isinstance(dir_loss_val, torch.Tensor) else dir_loss_val
-        
-        box_loss = loc_loss + dir_loss_val
+            dir_logits = box_dir_cls_preds.view(batch_size, -1, self.model_cfg.NUM_DIR_BINS)
+            weights = positives.type_as(dir_logits)
+            weights /= torch.clamp(weights.sum(-1, keepdim=True), min=1.0)
+            dir_loss = self.dir_loss_func(dir_logits, dir_targets, weights=weights)
+            dir_loss = dir_loss.sum() / batch_size
+            dir_loss = dir_loss * self.model_cfg.LOSS_CONFIG.LOSS_WEIGHTS['dir_weight']
+            box_loss = box_loss+dir_loss
+            tb_dict['rpn_loss_dir'] = dir_loss.item()
 
         return box_loss, tb_dict
 
