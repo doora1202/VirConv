@@ -93,31 +93,43 @@ class PillarVFE(VFETemplate):
 
     def forward(self, batch_dict, **kwargs):
   
-        voxel_features, voxel_num_points, coords = batch_dict['voxels'], batch_dict['voxel_num_points'], batch_dict['voxel_coords']
-        points_mean = voxel_features[:, :, :3].sum(dim=1, keepdim=True) / voxel_num_points.type_as(voxel_features).view(-1, 1, 1)
-        f_cluster = voxel_features[:, :, :3] - points_mean
-
-        f_center = torch.zeros_like(voxel_features[:, :, :3])
-        f_center[:, :, 0] = voxel_features[:, :, 0] - (coords[:, 3].to(voxel_features.dtype).unsqueeze(1) * self.voxel_x + self.x_offset)
-        f_center[:, :, 1] = voxel_features[:, :, 1] - (coords[:, 2].to(voxel_features.dtype).unsqueeze(1) * self.voxel_y + self.y_offset)
-        f_center[:, :, 2] = voxel_features[:, :, 2] - (coords[:, 1].to(voxel_features.dtype).unsqueeze(1) * self.voxel_z + self.z_offset)
-
-        if self.use_absolute_xyz:
-            features = [voxel_features, f_cluster, f_center]
+        if 'transform_param' in batch_dict:
+            trans_param = batch_dict['transform_param']
+            rot_num = trans_param.shape[1]
         else:
-            features = [voxel_features[..., 3:], f_cluster, f_center]
+            rot_num = 1
 
-        if self.with_distance:
-            points_dist = torch.norm(voxel_features[:, :, :3], 2, 2, keepdim=True)
-            features.append(points_dist)
-        features = torch.cat(features, dim=-1)
+        for i in range(rot_num):
+            if i==0:
+                frame_id = ''
+            else:
+                frame_id = str(i)
+            voxel_features, voxel_num_points, coords = batch_dict['voxels'], batch_dict['voxel_num_points'], batch_dict['voxel_coords']
+            points_mean = voxel_features[:, :, :3].sum(dim=1, keepdim=True) / voxel_num_points.type_as(voxel_features).view(-1, 1, 1)
+            f_cluster = voxel_features[:, :, :3] - points_mean
 
-        voxel_count = features.shape[1]
-        mask = self.get_paddings_indicator(voxel_num_points, voxel_count, axis=0)
-        mask = torch.unsqueeze(mask, -1).type_as(voxel_features)
-        features *= mask
-        for pfn in self.pfn_layers:
-            features = pfn(features)
-        features = features.squeeze()
-        batch_dict['pillar_features'] = features
+            f_center = torch.zeros_like(voxel_features[:, :, :3])
+            f_center[:, :, 0] = voxel_features[:, :, 0] - (coords[:, 3].to(voxel_features.dtype).unsqueeze(1) * self.voxel_x + self.x_offset)
+            f_center[:, :, 1] = voxel_features[:, :, 1] - (coords[:, 2].to(voxel_features.dtype).unsqueeze(1) * self.voxel_y + self.y_offset)
+            f_center[:, :, 2] = voxel_features[:, :, 2] - (coords[:, 1].to(voxel_features.dtype).unsqueeze(1) * self.voxel_z + self.z_offset)
+
+            if self.use_absolute_xyz:
+                features = [voxel_features, f_cluster, f_center]
+            else:
+                features = [voxel_features[..., 3:], f_cluster, f_center]
+
+            if self.with_distance:
+                points_dist = torch.norm(voxel_features[:, :, :3], 2, 2, keepdim=True)
+                features.append(points_dist)
+            features = torch.cat(features, dim=-1)
+
+            voxel_count = features.shape[1]
+            mask = self.get_paddings_indicator(voxel_num_points, voxel_count, axis=0)
+            mask = torch.unsqueeze(mask, -1).type_as(voxel_features)
+            features *= mask
+            for pfn in self.pfn_layers:
+                features = pfn(features)
+            features = features.squeeze()
+            batch_dict['voxel_features' + frame_id] = features
+            
         return batch_dict

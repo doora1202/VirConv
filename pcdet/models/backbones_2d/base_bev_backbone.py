@@ -22,6 +22,14 @@ class BaseBEVBackbone(nn.Module):
             upsample_strides = self.model_cfg.UPSAMPLE_STRIDES
         else:
             upsample_strides = num_upsample_filters = []
+        
+        if self.model_cfg.get('DILATION', None) is not None:
+            assert len(self.model_cfg.LAYER_NUMS) == len(self.model_cfg.LAYER_STRIDES) == len(self.model_cfg.NUM_FILTERS)
+            layer_nums = self.model_cfg.LAYER_NUMS
+            layer_strides = self.model_cfg.LAYER_STRIDES
+            num_filters = self.model_cfg.NUM_FILTERS
+        else:
+            layer_nums = layer_strides = num_filters = []
 
         num_levels = len(layer_nums)
         c_in_list = [input_channels, *num_filters[:-1]]
@@ -38,11 +46,19 @@ class BaseBEVBackbone(nn.Module):
                 nn.ReLU()
             ]
             for k in range(layer_nums[idx]):
-                cur_layers.extend([
-                    nn.Conv2d(num_filters[idx], num_filters[idx], kernel_size=3, padding=1, bias=False),
-                    nn.BatchNorm2d(num_filters[idx], eps=1e-3, momentum=0.01),
-                    nn.ReLU()
-                ])
+                if self.model_cfg.get('DILATION', None) is not None:
+                    padding = self.model_cfg.DILATION
+                    cur_layers.extend([
+                        nn.Conv2d(num_filters[idx], num_filters[idx], kernel_size=3, padding=padding, dilation=self.model_cfg.DILATION, bias=False),
+                        nn.BatchNorm2d(num_filters[idx], eps=1e-3, momentum=0.01),
+                        nn.ReLU()
+                    ])
+                else:
+                    cur_layers.extend([
+                        nn.Conv2d(num_filters[idx], num_filters[idx], kernel_size=3, padding=1, bias=False),
+                        nn.BatchNorm2d(num_filters[idx], eps=1e-3, momentum=0.01),
+                        nn.ReLU()
+                    ])
             self.blocks.append(nn.Sequential(*cur_layers))
             if len(upsample_strides) > 0:
                 stride = upsample_strides[idx]

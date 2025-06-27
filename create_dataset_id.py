@@ -7,8 +7,8 @@ total_files = end_index - start_index + 1
 
 
 num_train = 3700
-num_val = 2000
-num_test = 1781
+num_val = 1700
+num_test = 2081
 
 if num_train + num_val + num_test != total_files:
     print(f"エラー: 指定された分割数 ({num_train} + {num_val} + {num_test} = {num_train+num_val+num_test}) が総ファイル数 ({total_files}) と一致しません。")
@@ -33,14 +33,14 @@ else:
     test_files_sorted = sorted(test_files, key=lambda x: int(x.split('.')[0]))
 
 
-    with open("train.txt", "w") as f:
+    with open("data/kitti/ImageSets/myset/train.txt", "w") as f:
         for file in train_files_sorted:
             f.write(file + "\n")
 
-    with open("val.txt", "w") as f:
+    with open("data/kitti/ImageSets/myset/val.txt", "w") as f:
         for file in val_files_sorted:
             f.write(file + "\n")
 
-    with open("test.txt", "w") as f:
+    with open("data/kitti/ImageSets/myset/test.txt", "w") as f:
         for file in test_files_sorted:
             f.write(file + "\n")
