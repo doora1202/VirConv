@@ -52,7 +52,7 @@ class PFNLayer(nn.Module):
 class PillarVFE(VFETemplate):
     def __init__(self, model_cfg, num_point_features, voxel_size, point_cloud_range):
         super().__init__(model_cfg=model_cfg)
-
+        self.original_num_point_features = num_point_features
         self.use_norm = self.model_cfg.USE_NORM
         self.with_distance = self.model_cfg.WITH_DISTANCE
         self.use_absolute_xyz = self.model_cfg.USE_ABSLOTE_XYZ
@@ -73,6 +73,19 @@ class PillarVFE(VFETemplate):
             )
         self.pfn_layers = nn.ModuleList(pfn_layers)
 
+        self.gate_input_dim = self.original_num_point_features
+        
+        self.gate_network = nn.Sequential(
+            nn.Linear(self.gate_input_dim, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1),
+            nn.Sigmoid()  # 出力を0〜1の混合比率αにする
+        )
+        # 2.f_smoothをf_sharpと同じ次元数に変換するプロジェクター層
+        self.smooth_input_dim = self.original_num_point_features
+        self.smooth_output_dim = self.num_filters[-1] # f_sharpの出力次元数
+        self.smooth_projector = nn.Linear(self.smooth_input_dim, self.smooth_output_dim)
+
         self.voxel_x = voxel_size[0]
         self.voxel_y = voxel_size[1]
         self.voxel_z = voxel_size[2]
@@ -92,7 +105,6 @@ class PillarVFE(VFETemplate):
         return paddings_indicator
 
     def forward(self, batch_dict, **kwargs):
-  
         if 'transform_param' in batch_dict:
             trans_param = batch_dict['transform_param']
             rot_num = trans_param.shape[1]
@@ -104,32 +116,56 @@ class PillarVFE(VFETemplate):
                 frame_id = ''
             else:
                 frame_id = str(i)
+        
             voxel_features, voxel_num_points, coords = batch_dict['voxels'], batch_dict['voxel_num_points'], batch_dict['voxel_coords']
+
+            # --- ここからが「適応的ブレンディング」のメイン処理 ---
+
+            # 1.【F_smooth】滑らかな特徴量を計算 (MeanVFEのロジック)
+            #    入力された点群特徴量(8次元など)を単純に平均する
+            points_mean_for_smooth = voxel_features.sum(dim=1, keepdim=False)
+            normalizer = torch.clamp_min(voxel_num_points.view(-1, 1), min=1.0).type_as(voxel_features)
+            f_smooth = points_mean_for_smooth / normalizer
+
+            # 2.【F_sharp】シャープな特徴量を計算 (PillarVFEのロジック)
+            #    既存のPillarVFEの処理をそのまま実行
             points_mean = voxel_features[:, :, :3].sum(dim=1, keepdim=True) / voxel_num_points.type_as(voxel_features).view(-1, 1, 1)
             f_cluster = voxel_features[:, :, :3] - points_mean
-
+            
             f_center = torch.zeros_like(voxel_features[:, :, :3])
             f_center[:, :, 0] = voxel_features[:, :, 0] - (coords[:, 3].to(voxel_features.dtype).unsqueeze(1) * self.voxel_x + self.x_offset)
             f_center[:, :, 1] = voxel_features[:, :, 1] - (coords[:, 2].to(voxel_features.dtype).unsqueeze(1) * self.voxel_y + self.y_offset)
             f_center[:, :, 2] = voxel_features[:, :, 2] - (coords[:, 1].to(voxel_features.dtype).unsqueeze(1) * self.voxel_z + self.z_offset)
 
             if self.use_absolute_xyz:
-                features = [voxel_features, f_cluster, f_center]
+                features_for_sharp = [voxel_features, f_cluster, f_center]
             else:
-                features = [voxel_features[..., 3:], f_cluster, f_center]
+                features_for_sharp = [voxel_features[..., 3:], f_cluster, f_center]
 
             if self.with_distance:
                 points_dist = torch.norm(voxel_features[:, :, :3], 2, 2, keepdim=True)
-                features.append(points_dist)
-            features = torch.cat(features, dim=-1)
+                features_for_sharp.append(points_dist)
+                
+            features_for_sharp = torch.cat(features_for_sharp, dim=-1)
 
-            voxel_count = features.shape[1]
+            voxel_count = features_for_sharp.shape[1]
             mask = self.get_paddings_indicator(voxel_num_points, voxel_count, axis=0)
             mask = torch.unsqueeze(mask, -1).type_as(voxel_features)
-            features *= mask
-            for pfn in self.pfn_layers:
-                features = pfn(features)
-            features = features.squeeze()
-            batch_dict['voxel_features' + frame_id] = features
             
+            features_for_sharp *= mask
+            
+            for pfn in self.pfn_layers:
+                features_for_sharp = pfn(features_for_sharp)
+                
+            f_sharp = features_for_sharp.squeeze()
+            
+            # 3.【αの計算】混合比率αをゲート機構で計算
+            #    ゲート機構の入力として、F_smoothを使うのが合理的
+            #    (フラグや信頼度スコアの平均情報が含まれているため)
+            alpha = self.gate_network(f_smooth)
+            
+            f_final = alpha * f_sharp + (1 - alpha) * self.smooth_projector(f_smooth)
+            
+            batch_dict['voxel_features' + frame_id] = f_final
+        
         return batch_dict
