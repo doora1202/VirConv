@@ -47,22 +47,32 @@ class PFNLayer(nn.Module):
             x_repeat = x_max.repeat(1, inputs.shape[1], 1)
             x_concatenated = torch.cat([x, x_repeat], dim=2)
             return x_concatenated
+        
 
-
-class PillarVFE(VFETemplate):
+class AdaptiveBlendingVFE(VFETemplate):
     def __init__(self, model_cfg, num_point_features, voxel_size, point_cloud_range):
         super().__init__(model_cfg=model_cfg)
+
+        self.original_num_point_features = num_point_features
 
         self.use_norm = self.model_cfg.USE_NORM
         self.with_distance = self.model_cfg.WITH_DISTANCE
         self.use_absolute_xyz = self.model_cfg.USE_ABSLOTE_XYZ
-        num_point_features += 6 if self.use_absolute_xyz else 3
+        
+        num_point_features_for_sharp = 0
+        if self.use_absolute_xyz:
+            num_point_features_for_sharp += self.original_num_point_features
+        else:
+            num_point_features_for_sharp += self.original_num_point_features - 3
+        
+        num_point_features_for_sharp += 6
+        
         if self.with_distance:
-            num_point_features += 1
-
+            num_point_features_for_sharp += 1
+        
         self.num_filters = self.model_cfg.NUM_FILTERS
         assert len(self.num_filters) > 0
-        num_filters = [num_point_features] + list(self.num_filters)
+        num_filters = [num_point_features_for_sharp] + list(self.num_filters)
 
         pfn_layers = []
         for i in range(len(num_filters) - 1):
@@ -72,6 +82,22 @@ class PillarVFE(VFETemplate):
                 PFNLayer(in_filters, out_filters, self.use_norm, last_layer=(i >= len(num_filters) - 2))
             )
         self.pfn_layers = nn.ModuleList(pfn_layers)
+
+        self.gate_pfn = PFNLayer(
+            in_channels=self.original_num_point_features,
+            out_channels=16,
+            use_norm=self.use_norm,
+            last_layer=True
+        )
+        self.gate_final_layer = nn.Sequential(
+            nn.Linear(16, 1),
+            nn.Sigmoid()
+        )
+
+        self.smooth_projector = nn.Linear(
+            self.original_num_point_features, 
+            self.num_filters[-1]
+        )
 
         self.voxel_x = voxel_size[0]
         self.voxel_y = voxel_size[1]
@@ -92,49 +118,47 @@ class PillarVFE(VFETemplate):
         return paddings_indicator
 
     def forward(self, batch_dict, **kwargs):
-  
-        if 'transform_param' in batch_dict:
-            trans_param = batch_dict['transform_param']
-            rot_num = trans_param.shape[1]
+        voxel_features, voxel_num_points, coords = batch_dict['voxels'], batch_dict['voxel_num_points'], batch_dict['voxel_coords']
+        
+        voxel_count = voxel_features.shape[1] 
+        mask = self.get_paddings_indicator(voxel_num_points, voxel_count, axis=0)
+        mask_for_sharp = torch.unsqueeze(mask, -1).type_as(voxel_features)
+
+        points_mean_for_smooth = voxel_features.sum(dim=1, keepdim=False)
+        normalizer = torch.clamp_min(voxel_num_points.view(-1, 1), min=1.0).type_as(voxel_features)
+        f_smooth = points_mean_for_smooth / normalizer
+        f_smooth_projected = self.smooth_projector(f_smooth)
+        
+        gated_features = self.gate_pfn(voxel_features * mask_for_sharp)
+        alpha = self.gate_final_layer(gated_features.squeeze(1))
+
+        points_mean_xyz = voxel_features[:, :, :3].sum(dim=1, keepdim=True) / voxel_num_points.type_as(voxel_features).view(-1, 1, 1)
+        f_cluster = voxel_features[:, :, :3] - points_mean_xyz
+        
+        f_center = torch.zeros_like(voxel_features[:, :, :3])
+        f_center[:, :, 0] = voxel_features[:, :, 0] - (coords[:, 3].to(voxel_features.dtype).unsqueeze(1) * self.voxel_x + self.x_offset)
+        f_center[:, :, 1] = voxel_features[:, :, 1] - (coords[:, 2].to(voxel_features.dtype).unsqueeze(1) * self.voxel_y + self.y_offset)
+        f_center[:, :, 2] = voxel_features[:, :, 2] - (coords[:, 1].to(voxel_features.dtype).unsqueeze(1) * self.voxel_z + self.z_offset)
+
+        if self.use_absolute_xyz:
+            features_for_sharp = [voxel_features, f_cluster, f_center]
         else:
-            rot_num = 1
+            features_for_sharp = [voxel_features[..., 3:], f_cluster, f_center]
 
-        for i in range(rot_num):
-            if i==0:
-                frame_id = ''
-            else:
-                frame_id = str(i)
+        if self.with_distance:
+            points_dist = torch.norm(voxel_features[:, :, :3], 2, 2, keepdim=True)
+            features_for_sharp.append(points_dist)
+            
+        features_for_sharp = torch.cat(features_for_sharp, dim=-1)
+        
+        features_for_sharp *= mask_for_sharp
+        
+        for pfn in self.pfn_layers:
+            features_for_sharp = pfn(features_for_sharp)
+            
+        f_sharp = features_for_sharp.squeeze(1)
 
-            voxel_features, voxel_num_points, coords = batch_dict['voxels'], batch_dict['voxel_num_points'], batch_dict['voxel_coords']
-
-            points_mean = voxel_features[:, :, :3].sum(dim=1, keepdim=True) / voxel_num_points.type_as(voxel_features).view(-1, 1, 1)
-            f_cluster = voxel_features[:, :, :3] - points_mean
-
-            f_center = torch.zeros_like(voxel_features[:, :, :3])
-            f_center[:, :, 0] = voxel_features[:, :, 0] - (coords[:, 3].to(voxel_features.dtype).unsqueeze(1) * self.voxel_x + self.x_offset)
-            f_center[:, :, 1] = voxel_features[:, :, 1] - (coords[:, 2].to(voxel_features.dtype).unsqueeze(1) * self.voxel_y + self.y_offset)
-            f_center[:, :, 2] = voxel_features[:, :, 2] - (coords[:, 1].to(voxel_features.dtype).unsqueeze(1) * self.voxel_z + self.z_offset)
-
-            if self.use_absolute_xyz:
-                features = [voxel_features, f_cluster, f_center]
-            else:
-                features = [voxel_features[..., 3:], f_cluster, f_center]
-
-            if self.with_distance:
-                points_dist = torch.norm(voxel_features[:, :, :3], 2, 2, keepdim=True)
-                features.append(points_dist)
-            features = torch.cat(features, dim=-1)
-
-
-            voxel_count = features.shape[1]
-            mask = self.get_paddings_indicator(voxel_num_points, voxel_count, axis=0)
-            mask = torch.unsqueeze(mask, -1).type_as(voxel_features)
-            features *= mask
-
-
-            for pfn in self.pfn_layers:
-                features = pfn(features)
-            features = features.squeeze()
-            batch_dict['voxel_features' + frame_id] = features
-
+        f_final = alpha * f_sharp + (1 - alpha) * f_smooth_projected
+        
+        batch_dict['voxel_features'] = f_final.contiguous()
         return batch_dict
