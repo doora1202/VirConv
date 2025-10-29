@@ -47,7 +47,7 @@ class PFNLayer(nn.Module):
             x_repeat = x_max.repeat(1, inputs.shape[1], 1)
             x_concatenated = torch.cat([x, x_repeat], dim=2)
             return x_concatenated
-        
+
 
 class AdaptiveBlendingVFE(VFETemplate):
     def __init__(self, model_cfg, num_point_features, voxel_size, point_cloud_range):
@@ -116,22 +116,26 @@ class AdaptiveBlendingVFE(VFETemplate):
         max_num = torch.arange(max_num, dtype=torch.int, device=actual_num.device).view(max_num_shape)
         paddings_indicator = actual_num.int() > max_num
         return paddings_indicator
-
-    def forward(self, batch_dict, **kwargs):
-        voxel_features, voxel_num_points, coords = batch_dict['voxels'], batch_dict['voxel_num_points'], batch_dict['voxel_coords']
-        
+    
+    def process_voxels(self, voxel_features, voxel_num_points, coords):
+        """
+        Helper function to process a single set of voxels.
+        """
         voxel_count = voxel_features.shape[1] 
         mask = self.get_paddings_indicator(voxel_num_points, voxel_count, axis=0)
         mask_for_sharp = torch.unsqueeze(mask, -1).type_as(voxel_features)
 
+        # --- Smooth Features (MeanVFE) ---
         points_mean_for_smooth = voxel_features.sum(dim=1, keepdim=False)
         normalizer = torch.clamp_min(voxel_num_points.view(-1, 1), min=1.0).type_as(voxel_features)
         f_smooth = points_mean_for_smooth / normalizer
         f_smooth_projected = self.smooth_projector(f_smooth)
         
+        # --- Gate Mechanism ---
         gated_features = self.gate_pfn(voxel_features * mask_for_sharp)
         alpha = self.gate_final_layer(gated_features.squeeze(1))
 
+        # --- Sharp Features (PillarVFE-like) ---
         points_mean_xyz = voxel_features[:, :, :3].sum(dim=1, keepdim=True) / voxel_num_points.type_as(voxel_features).view(-1, 1, 1)
         f_cluster = voxel_features[:, :, :3] - points_mean_xyz
         
@@ -158,7 +162,34 @@ class AdaptiveBlendingVFE(VFETemplate):
             
         f_sharp = features_for_sharp.squeeze(1)
 
+        # --- Adaptive Blending ---
         f_final = alpha * f_sharp + (1 - alpha) * f_smooth_projected
         
-        batch_dict['voxel_features'] = f_final.contiguous()
+        return f_final
+
+    def forward(self, batch_dict, **kwargs):
+        # Determine the number of rotations from data augmentation
+        if 'transform_param' in batch_dict:
+            rot_num = batch_dict['transform_param'].shape[1]
+        else:
+            rot_num = 1
+
+        for i in range(rot_num):
+            frame_id = '' if i == 0 else str(i)
+            
+            voxel_features = batch_dict['voxels' + frame_id]
+            voxel_num_points = batch_dict['voxel_num_points' + frame_id]
+            coords = batch_dict['voxel_coords' + frame_id]
+            
+            final_features = self.process_voxels(voxel_features, voxel_num_points, coords)
+            batch_dict['voxel_features' + frame_id] = final_features.contiguous()
+
+            if 'mm' in batch_dict:
+                voxel_features_mm = batch_dict['voxels_mm' + frame_id]
+                voxel_num_points_mm = batch_dict['voxel_num_points_mm' + frame_id]
+                coords_mm = batch_dict['voxel_coords_mm' + frame_id]
+
+                final_features_mm = self.process_voxels(voxel_features_mm, voxel_num_points_mm, coords_mm)
+                batch_dict['voxel_features_mm' + frame_id] = final_features_mm.contiguous()
+
         return batch_dict
