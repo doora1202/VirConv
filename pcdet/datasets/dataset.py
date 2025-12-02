@@ -174,6 +174,10 @@ class DatasetTemplate(torch_data.Dataset):
         discard points by a bin-based sampling.
         """
         retain_rate = 1 - rate
+        
+        if retain_rate <= 0:
+            return points[:0]
+        
         parts, pos, distant_points_num_acc = self.partition(points, num=bin_num, rate=retain_rate)
 
         output_pts_num = int(points.shape[0] * retain_rate)
