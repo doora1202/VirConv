@@ -174,6 +174,9 @@ class DatasetTemplate(torch_data.Dataset):
         discard points by a bin-based sampling.
         """
         retain_rate = 1 - rate
+
+        if retain_rate == 1:
+            return points
         
         if retain_rate <= 0:
             return points[:0]
@@ -276,6 +279,9 @@ class DatasetTemplate(torch_data.Dataset):
                     points_mm = data_dict['points' + rot_num_id][data_dict['points' + rot_num_id][:, -1] == 1]
                     points = data_dict['points'+rot_num_id][data_dict['points'+rot_num_id][:, -1] == 2]
 
+                    if self.dataset_cfg.get('USE_IMAGE_POINTS_ONLY', False):
+                        points = points[:0]
+
                     if self.training:
                         points_mm2 = self.input_point_discard(points_mm, rate=self.input_discard_rate)
                     else:
@@ -287,6 +293,9 @@ class DatasetTemplate(torch_data.Dataset):
                 else:
                     points_mm = data_dict['points' + rot_num_id][data_dict['points' + rot_num_id][:, -1] == 1]
                     points = data_dict['points' + rot_num_id][data_dict['points' + rot_num_id][:, -1] == 2]
+
+                    if self.dataset_cfg.get('USE_IMAGE_POINTS_ONLY', False):
+                        points = points[:0]
 
                     if self.training:
                         points_mm2 = self.input_point_discard(points_mm, rate=self.input_discard_rate)
