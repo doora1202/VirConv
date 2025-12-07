@@ -58,6 +58,14 @@ class DatasetTemplate(torch_data.Dataset):
 
         self.input_discard_rate = self.dataset_cfg.get('INPUT_DISCARD_RATE', 0.8)
 
+        if self.dataset_cfg.get('MODAL_DROP', False) and self.training:
+            modal_drop_probs = self.dataset_cfg.get('MODAL_DROP_PROBS', [0.5, 0.25, 0.25])
+            assert len(modal_drop_probs) == 3, 'MODAL_DROP_PROBS must be a list of 3 floats.'
+            assert np.isclose(sum(modal_drop_probs), 1.0), 'Sum of MODAL_DROP_PROBS must be 1.0.'
+            self.modal_drop_probs_cumulative = np.cumsum(modal_drop_probs).tolist()
+        else:
+            self.modal_drop_probs_cumulative = None
+
         self.grid_size = self.data_processor.grid_size
         self.voxel_size = self.data_processor.voxel_size
         self.total_epochs = 0
@@ -279,11 +287,9 @@ class DatasetTemplate(torch_data.Dataset):
                     points_mm = data_dict['points' + rot_num_id][data_dict['points' + rot_num_id][:, -1] == 1]
                     points = data_dict['points'+rot_num_id][data_dict['points'+rot_num_id][:, -1] == 2]
 
-                    if self.dataset_cfg.get('USE_IMAGE_POINTS_ONLY', False):
-                        points = points[:0]
-
                     if self.training:
                         points_mm2 = self.input_point_discard(points_mm, rate=self.input_discard_rate)
+                        
                     else:
                         points_mm2 = self.input_point_discard(points_mm, bin_num=10, rate=self.input_discard_rate)
 
@@ -299,6 +305,15 @@ class DatasetTemplate(torch_data.Dataset):
 
                     if self.training:
                         points_mm2 = self.input_point_discard(points_mm, rate=self.input_discard_rate)
+
+                        if self.dataset_cfg.get('MODAL_DROP', False):
+                            p = np.random.rand()
+                            if p < self.modal_drop_probs_cumulative[0]:  # multi-modal
+                                pass
+                            elif p < self.modal_drop_probs_cumulative[1]:  # lidar only
+                                points_mm2 = points_mm2[:0]
+                            else:  # camera only
+                                points = points[:0]
                     else:
                         points_mm2 = self.input_point_discard(points_mm, bin_num=10, rate=self.input_discard_rate)
 
