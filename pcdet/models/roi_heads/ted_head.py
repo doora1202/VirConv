@@ -251,6 +251,7 @@ class TEDMHead(RoIHeadTemplate):
 
         self.cls_layers = nn.ModuleList()
         self.reg_layers = nn.ModuleList()
+        self.iou_layers = nn.ModuleList()
 
         for i in range(self.rot_num):
             pre_channel = self.model_cfg.SHARED_FC[-1] * 2 * 2
@@ -286,10 +287,26 @@ class TEDMHead(RoIHeadTemplate):
             reg_fc_list.append(nn.Linear(pre_channel, self.box_coder.code_size * self.num_class, bias=True))
             reg_fc_layers = nn.Sequential(*reg_fc_list)
             self.reg_layers.append(reg_fc_layers)
+
+            if self.model_cfg.get("USE_IOU_SCORE", False):
+                pre_channel = self.model_cfg.SHARED_FC[-1] * 2 * 2
+                iou_fc_list = []
+                for k in range(0, self.model_cfg.REG_FC.__len__()):
+                    iou_fc_list.extend([
+                        nn.Linear(pre_channel, self.model_cfg.REG_FC[k], bias=False),
+                        nn.BatchNorm1d(self.model_cfg.REG_FC[k]),
+                        nn.ReLU()
+                    ])
+                    pre_channel = self.model_cfg.REG_FC[k]
+                
+                iou_fc_list.append(nn.Linear(pre_channel, self.num_class, bias=True))
+                iou_fc_layers = nn.Sequential(*iou_fc_list)
+                self.iou_layers.append(iou_fc_layers)
             break
 
         self.cls_layers_P = nn.ModuleList()
         self.reg_layers_P = nn.ModuleList()
+        self.iou_layers_P = nn.ModuleList()
 
         for i in range(self.rot_num):
             pre_channel = self.model_cfg.SHARED_FC[-1] * 2
@@ -325,10 +342,27 @@ class TEDMHead(RoIHeadTemplate):
             reg_fc_list.append(nn.Linear(pre_channel, self.box_coder.code_size * self.num_class, bias=True))
             reg_fc_layers = nn.Sequential(*reg_fc_list)
             self.reg_layers_P.append(reg_fc_layers)
+
+            if self.model_cfg.get("USE_IOU_SCORE", False):
+                pre_channel = self.model_cfg.SHARED_FC[-1] * 2
+                iou_fc_list = []
+                for k in range(0, self.model_cfg.REG_FC.__len__()):
+                    iou_fc_list.extend([
+                        nn.Linear(pre_channel, self.model_cfg.REG_FC[k], bias=False),
+                        nn.BatchNorm1d(self.model_cfg.REG_FC[k]),
+                        nn.ReLU()
+                    ])
+                    pre_channel = self.model_cfg.REG_FC[k]
+                
+                iou_fc_list.append(nn.Linear(pre_channel, self.num_class, bias=True))
+                iou_fc_layers = nn.Sequential(*iou_fc_list)
+                self.iou_layers_P.append(iou_fc_layers)
+
             break
 
         self.cls_layers_PI = nn.ModuleList()
         self.reg_layers_PI = nn.ModuleList()
+        self.iou_layers_PI = nn.ModuleList()
 
         for i in range(self.rot_num):
             pre_channel = self.model_cfg.SHARED_FC[-1] * 2
@@ -364,7 +398,24 @@ class TEDMHead(RoIHeadTemplate):
             reg_fc_list.append(nn.Linear(pre_channel, self.box_coder.code_size * self.num_class, bias=True))
             reg_fc_layers = nn.Sequential(*reg_fc_list)
             self.reg_layers_PI.append(reg_fc_layers)
+
+            if self.model_cfg.get("USE_IOU_SCORE", False):
+                pre_channel = self.model_cfg.SHARED_FC[-1] * 2
+                iou_fc_list = []
+                for k in range(0, self.model_cfg.REG_FC.__len__()):
+                    iou_fc_list.extend([
+                        nn.Linear(pre_channel, self.model_cfg.REG_FC[k], bias=False),
+                        nn.BatchNorm1d(self.model_cfg.REG_FC[k]),
+                        nn.ReLU()
+                    ])
+                    pre_channel = self.model_cfg.REG_FC[k]
+                
+                iou_fc_list.append(nn.Linear(pre_channel, self.num_class, bias=True))
+                iou_fc_layers = nn.Sequential(*iou_fc_list)
+                self.iou_layers_PI.append(iou_fc_layers)
             break
+
+
 
 
         if self.model_cfg.get('PART', False):
@@ -389,8 +440,6 @@ class TEDMHead(RoIHeadTemplate):
             # input()
             self.cross_attention_layers.append(this_mo)
             break
-
-
         self.cross_attention_layers_mm = nn.ModuleList()
         for i in range(self.rot_num):
             this_mo = CrossAttention(self.shared_channel)
@@ -399,20 +448,27 @@ class TEDMHead(RoIHeadTemplate):
             self.cross_attention_layers_mm.append(this_mo)
             break
 
+        self.use_iou_score = self.model_cfg.get("USE_IOU_SCORE", False)
+        if self.use_iou_score:
+            self.alpha = self.model_cfg.get('ALPHA', 0.5)
 
         self.init_weights()
         self.ious = {0: [], 1: [], 2: [], 3: []}
 
     def init_weights(self):
         init_func = nn.init.xavier_normal_
-        for module_list in [self.cls_layers, self.reg_layers]:
+        module_lists = [self.cls_layers, self.reg_layers, self.cls_layers_P, self.reg_layers_P, self.cls_layers_PI, self.reg_layers_PI]
+        if self.use_iou_score:
+            module_lists.extend([self.iou_layers, self.iou_layers_P, self.iou_layers_PI])
+
+        for module_list in module_lists:
             for stage_module in module_list:
                 for m in stage_module.modules():
                     if isinstance(m, nn.Linear):
                         init_func(m.weight)
                         if m.bias is not None:
                             nn.init.constant_(m.bias, 0)
-        for module_list in [self.cls_layers, self.reg_layers]:
+        for module_list in module_lists:
             for stage_module in module_list:
                 nn.init.normal_(stage_module[-1].weight, 0, 0.01)
                 nn.init.constant_(stage_module[-1].bias, 0)
@@ -817,10 +873,18 @@ class TEDMHead(RoIHeadTemplate):
             final_feat = torch.cat([cur_feat_mm, cur_feat],-1)
             rcnn_cls = self.cls_layers[0](final_feat)
             rcnn_reg = self.reg_layers[0](final_feat)
+            if self.use_iou_score:
+                rcnn_iou = self.iou_layers[0](final_feat)
+
             rcnn_cls_pi = self.cls_layers_PI[0](cur_feat_mm)
             rcnn_reg_pi = self.reg_layers_PI[0](cur_feat_mm)
+            if self.use_iou_score:
+                rcnn_iou_pi = self.iou_layers_PI[0](cur_feat_mm)
+            
             rcnn_cls_p = self.cls_layers_P[0](cur_feat)
             rcnn_reg_p = self.reg_layers_P[0](cur_feat)
+            if self.use_iou_score:
+                rcnn_iou_p = self.iou_layers_P[0](cur_feat)
 
 
             if self.model_cfg.get('PART', False):
@@ -831,6 +895,12 @@ class TEDMHead(RoIHeadTemplate):
             batch_cls_preds, batch_box_preds = self.generate_predicted_boxes(
                 batch_size=batch_dict['batch_size'], rois=batch_dict['rois'], cls_preds=rcnn_cls, box_preds=rcnn_reg
             )
+            
+            if self.use_iou_score:
+                iou_preds = rcnn_iou.view(batch_dict['batch_size'], -1, 1)
+
+                batch_cls_preds = (batch_cls_preds.sigmoid()**(1-self.alpha) * iou_preds.sigmoid()**self.alpha).pow(0.5)
+                batch_cls_preds = torch.clamp(batch_cls_preds, min=0.001, max=1.0)
 
             outs = batch_box_preds.clone()
             if 'transform_param' in batch_dict:
@@ -843,10 +913,18 @@ class TEDMHead(RoIHeadTemplate):
                 targets_dict_p = copy.deepcopy(targets_dict)
                 targets_dict['rcnn_cls'] = rcnn_cls
                 targets_dict['rcnn_reg'] = rcnn_reg
+                if self.use_iou_score:
+                    targets_dict['rcnn_iou'] = rcnn_iou
+                
                 targets_dict_pi['rcnn_cls'] = rcnn_cls_pi
                 targets_dict_pi['rcnn_reg'] = rcnn_reg_pi
+                if self.use_iou_score:
+                    targets_dict_pi['rcnn_iou'] = rcnn_iou_pi
+
                 targets_dict_p['rcnn_cls'] = rcnn_cls_p
                 targets_dict_p['rcnn_reg'] = rcnn_reg_p
+                if self.use_iou_score:
+                    targets_dict_p['rcnn_iou'] = rcnn_iou_p
 
                 self.forward_ret_dict['targets_dict' + rot_num_id] = targets_dict
                 self.forward_ret_dict['targets_dict_pi' + rot_num_id] = targets_dict_pi
@@ -873,3 +951,55 @@ class TEDMHead(RoIHeadTemplate):
             batch_dict['batch_cls_preds'] = scores
 
         return batch_dict
+
+    def get_iou_layer_loss(self, forward_ret_dict):
+        loss_cfgs = self.model_cfg.LOSS_CONFIG
+        rcnn_iou = forward_ret_dict['rcnn_iou']
+        rcnn_cls_labels = forward_ret_dict['rcnn_cls_labels'].view(-1)
+        
+        iou_gt = forward_ret_dict['gt_iou_of_rois'].view(-1)
+
+        iou_valid_mask = (rcnn_cls_labels > 0).float()
+
+        batch_loss_iou = F.binary_cross_entropy(torch.sigmoid(rcnn_iou.view(-1)), iou_gt, reduction='none')
+
+        iou_loss = (batch_loss_iou * iou_valid_mask).sum() / torch.clamp(iou_valid_mask.sum(), min=1.0)
+        
+        rcnn_loss_iou = iou_loss * loss_cfgs.LOSS_WEIGHTS['rcnn_iou_pred_weight']
+        tb_dict = {'rcnn_loss_iou': rcnn_loss_iou.item()}
+        return rcnn_loss_iou, tb_dict
+
+    def get_loss(self, tb_dict=None):
+        tb_dict = {} if tb_dict is None else tb_dict
+        rcnn_loss = 0
+        for i in range(self.rot_num):
+            if 'targets_dict'+str(i) in self.forward_ret_dict:
+                rcnn_loss_cls, cls_tb_dict = self.get_box_cls_layer_loss(self.forward_ret_dict['targets_dict'+str(i)])
+                rcnn_loss += rcnn_loss_cls
+                rcnn_loss_reg, reg_tb_dict = self.get_box_reg_layer_loss(self.forward_ret_dict['targets_dict'+str(i)])
+                rcnn_loss += rcnn_loss_reg
+                if self.use_iou_score:
+                    rcnn_loss_iou, iou_tb_dict = self.get_iou_layer_loss(self.forward_ret_dict['targets_dict'+str(i)])
+                    rcnn_loss += rcnn_loss_iou
+
+            if 'targets_dict_pi'+str(i) in self.forward_ret_dict:
+                rcnn_loss_cls, cls_tb_dict = self.get_box_cls_layer_loss(self.forward_ret_dict['targets_dict_pi' + str(i)])
+                rcnn_loss += 0.5*rcnn_loss_cls
+                rcnn_loss_reg, reg_tb_dict = self.get_box_reg_layer_loss(self.forward_ret_dict['targets_dict_pi' + str(i)])
+                rcnn_loss += 0.5*rcnn_loss_reg
+                if self.use_iou_score:
+                    rcnn_loss_iou, iou_tb_dict = self.get_iou_layer_loss(self.forward_ret_dict['targets_dict_pi'+str(i)])
+                    rcnn_loss += 0.5 * rcnn_loss_iou
+
+            if 'targets_dict_p'+str(i) in self.forward_ret_dict:
+                rcnn_loss_cls, cls_tb_dict = self.get_box_cls_layer_loss(self.forward_ret_dict['targets_dict_p' + str(i)])
+                rcnn_loss += 0.5*rcnn_loss_cls
+                rcnn_loss_reg, reg_tb_dict = self.get_box_reg_layer_loss(self.forward_ret_dict['targets_dict_p' + str(i)])
+                rcnn_loss += 0.5*rcnn_loss_reg
+                if self.use_iou_score:
+                    rcnn_loss_iou, iou_tb_dict = self.get_iou_layer_loss(self.forward_ret_dict['targets_dict_p'+str(i)])
+                    rcnn_loss += 0.5 * rcnn_loss_iou
+
+        tb_dict['rcnn_loss'] = rcnn_loss.item()
+
+        return rcnn_loss, tb_dict

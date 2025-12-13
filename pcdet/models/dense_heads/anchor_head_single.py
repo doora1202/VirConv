@@ -51,6 +51,13 @@ class AnchorHeadSingle(AnchorHeadTemplate):
             input_channels, self.num_anchors_per_location * self.box_coder.code_size,
             kernel_size=1
         )
+        self.use_iou_score = self.model_cfg.get("USE_IOU_SCORE", False)
+        if self.use_iou_score:
+            self.conv_iou = nn.Conv2d(
+                input_channels, self.num_anchors_per_location,
+                kernel_size=1
+            )
+            self.alpha = self.model_cfg.get("ALPHA", 0.5)
 
 
         if self.model_cfg.get('USE_DIRECTION_CLASSIFIER', None) is not None:
@@ -71,6 +78,9 @@ class AnchorHeadSingle(AnchorHeadTemplate):
         pi = 0.01
         nn.init.constant_(self.conv_cls.bias, -np.log((1 - pi) / pi))
         nn.init.normal_(self.conv_box.weight, mean=0, std=0.001)
+        if self.use_iou_score:
+            nn.init.normal_(self.conv_iou.weight, mean=0, std=0.001)
+            nn.init.constant_(self.conv_iou.bias, 0)
 
     def get_anchor_mask(self,data_dict,shape):
 
@@ -133,6 +143,11 @@ class AnchorHeadSingle(AnchorHeadTemplate):
         cls_preds = cls_preds.permute(0, 2, 3, 1).contiguous()[:,anchor_mask,:]  # [N, H, W, C]
         box_preds = box_preds.permute(0, 2, 3, 1).contiguous()[:,anchor_mask,:]  # [N, H, W, C]
 
+        if self.use_iou_score:
+            iou_preds = self.conv_iou(st_features_2d)
+            iou_preds = iou_preds.permute(0, 2, 3, 1).contiguous()[:,anchor_mask,:]
+            self.forward_ret_dict['iou_preds'] = iou_preds
+
         self.forward_ret_dict['cls_preds'] = cls_preds
         self.forward_ret_dict['box_preds'] = box_preds
 
@@ -157,9 +172,18 @@ class AnchorHeadSingle(AnchorHeadTemplate):
                 batch_size=data_dict['batch_size'],
                 cls_preds=cls_preds, box_preds=box_preds, dir_cls_preds=dir_cls_preds
             )
+            
+            if self.use_iou_score:
+                batch_iou_preds = iou_preds.view(batch_box_preds.shape[0], -1, 1)
+                batch_cls_preds = (batch_cls_preds.sigmoid()**(1-self.alpha) * batch_iou_preds.sigmoid()**self.alpha).pow(0.5)
+                batch_cls_preds = torch.clamp(batch_cls_preds, min=0.001, max=1.0)
+                data_dict['cls_preds_normalized'] = True
+            else:
+                data_dict['cls_preds_normalized'] = False
+
+
             data_dict['batch_cls_preds'] = batch_cls_preds
             data_dict['batch_box_preds'] = batch_box_preds
-            data_dict['cls_preds_normalized'] = False
 
         if self.model_cfg.get('NMS_CONFIG', None) is not None:
             self.proposal_layer(
@@ -167,3 +191,37 @@ class AnchorHeadSingle(AnchorHeadTemplate):
             )
 
         return data_dict
+
+    def get_iou_loss(self):
+        iou_preds = self.forward_ret_dict['iou_preds']
+        iou_targets = self.forward_ret_dict['gt_ious']
+        pos_mask = self.forward_ret_dict['box_cls_labels'] > 0
+        
+        loss_cfgs = self.model_cfg.LOSS_CONFIG
+        iou_loss = nn.functional.binary_cross_entropy_with_logits(iou_preds[pos_mask], iou_targets[pos_mask], reduction='none')
+        iou_loss = (iou_loss * loss_cfgs.LOSS_WEIGHTS['iou_pred_weight']).sum() / torch.clamp(pos_mask.sum(), min=1.0)
+        
+        tb_dict = {
+            'rpn_loss_iou': iou_loss.item()
+        }
+        return iou_loss, tb_dict
+
+    def get_loss(self):
+        cls_loss, tb_dict = self.get_cls_layer_loss()
+        box_loss, tb_dict_box = self.get_box_reg_layer_loss()
+        
+        tb_dict.update(tb_dict_box)
+        rpn_loss = cls_loss + box_loss
+        
+        if self.use_iou_score:
+            iou_loss, tb_dict_iou = self.get_iou_loss()
+            tb_dict.update(tb_dict_iou)
+            rpn_loss += iou_loss
+
+        if self.model_cfg.get('OD_LOSS',False):
+            od_loss = self.get_od_loss()
+            rpn_loss += od_loss
+
+        tb_dict['rpn_loss'] = rpn_loss.item()
+        return rpn_loss, tb_dict
+
