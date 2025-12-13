@@ -197,6 +197,9 @@ class AnchorHeadSingle(AnchorHeadTemplate):
         iou_targets = self.forward_ret_dict['gt_ious']
         pos_mask = self.forward_ret_dict['box_cls_labels'] > 0
         
+        batch_size = iou_preds.shape[0]
+        iou_preds = iou_preds.view(batch_size, -1)
+
         loss_cfgs = self.model_cfg.LOSS_CONFIG
         iou_loss = nn.functional.binary_cross_entropy_with_logits(iou_preds[pos_mask], iou_targets[pos_mask], reduction='none')
         iou_loss = (iou_loss * loss_cfgs.LOSS_WEIGHTS['iou_pred_weight']).sum() / torch.clamp(pos_mask.sum(), min=1.0)
