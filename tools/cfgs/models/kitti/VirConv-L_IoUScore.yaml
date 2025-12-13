@@ -291,7 +291,7 @@ OPTIMIZATION:
     NUM_EPOCHS: 50
 
     OPTIMIZER: adam_onecycle
-    LR: 0.001
+    LR: 0.01
     WEIGHT_DECAY: 0.01
     MOMENTUM: 0.9
 
