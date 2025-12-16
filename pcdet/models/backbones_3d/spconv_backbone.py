@@ -541,6 +541,8 @@ class VirConvL8x(nn.Module):
         self.model_cfg = model_cfg
         self.x_trans_train = X_TRANS()
 
+        self.remove_rgb_features = self.model_cfg.get('REMOVE_RGB_FEATURES', True)
+
         self.return_num_features_as_dict = model_cfg.RETURN_NUM_FEATURES_AS_DICT
         self.out_features = model_cfg.OUT_FEATURES
         self.layer_discard_rate = model_cfg.LAYER_DISCARD_RATE
@@ -633,8 +635,9 @@ class VirConvL8x(nn.Module):
             newvoxel_features, newvoxel_coords = batch_dict['voxel_features' + rot_num_id], batch_dict[
                 'voxel_coords' + rot_num_id]
 
-            newvoxel_features[:, 4:7] = 0 # remove the useless RGB features
-            newvoxel_features[:, 7] * 100 # highlight the indicator value regarding LiDAR and RGB point
+            if self.remove_rgb_features:
+                newvoxel_features[:, 4:7] = 0  # remove the useless RGB features
+            newvoxel_features[:, 7] * 100  # highlight the indicator value regarding LiDAR and RGB point
 
             newinput_sp_tensor = spconv.SparseConvTensor(
                 features=newvoxel_features,
@@ -959,11 +962,3 @@ class VoxelResBackBone8x(nn.Module):
         })
 
         return batch_dict
-
-
-
-
-
-
-
-
